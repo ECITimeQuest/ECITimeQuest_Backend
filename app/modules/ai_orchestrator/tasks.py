@@ -1,6 +1,10 @@
 import json
 import logging
 from typing import Dict, Any
+from app.database import SessionLocal
+from app.modules.auth.models import User
+from app.enums.enums import SubscriptionPlan
+
 from pydantic import ValidationError
 from openai import RateLimitError, APIConnectionError
 from app.modules.ai_orchestrator.schemas import (
@@ -109,6 +113,11 @@ def analyze_gaps_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     Saves the result in the domain cache.
     """
     p = AITaskPayload(**payload)
+
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.id == p.user_id).first()
+        if not user or user.subscription_plan != SubscriptionPlan.PREMIUM:
+            raise ValueError("Gap analysis is only available for premium users.")
 
     logger.info(
         f"Starting analyze_gaps_task for reference: {p.reference_id}, user: {p.user_id}"

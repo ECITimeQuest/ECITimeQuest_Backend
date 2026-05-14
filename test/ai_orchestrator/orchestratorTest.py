@@ -4,13 +4,14 @@ Tests for the AI Orchestrator module.
 Coverage:
 - AITaskRegistry (register, get_task, duplicate detection)
 - Prompt Engine (all 4 builders including build_answer_explanation_prompt)
-- analyze_gaps_task logic (empty gaps early return, LLM call, validation)
+- analyze_gaps_task logic (premium check: success, free user denied, user not found, LLM call, validation)
 - generate_quiz_task logic (success, LLM failure)
 - expand_content_task logic (success, LLM failure)
 - explain_answer_task logic (success, LLM failure, prompt builder)
 - LLMGateway (success, rate limit, api error, json decode error, empty response)
 - AIOrchestratorService (cache hit, in-progress deduplication, new task dispatch,
-  ValueError on unknown task, learning context enrichment exception, get_task_status branches)
+  ValueError on unknown task, learning context enrichment exception, get_task_status branches,
+  concept_gaps cleared for free users in _fetch_learning_context)
 - Router endpoints (POST /ai/task, GET /ai/task/{task_id}, 500 error handlers)
 """
 
@@ -58,7 +59,17 @@ AUTH_LOOKUP_PATH = "app.modules.ai_orchestrator.router.get_user_by_firebase_uid"
 
 
 def _fake_user():
-    return MagicMock(id=USER_ID)
+    from app.enums.enums import SubscriptionPlan
+    user = MagicMock(id=USER_ID)
+    user.subscription_plan = SubscriptionPlan.FREE
+    return user
+
+
+def _fake_premium_user():
+    from app.enums.enums import SubscriptionPlan
+    user = MagicMock(id=USER_ID)
+    user.subscription_plan = SubscriptionPlan.PREMIUM
+    return user
 
 
 def _learning_ctx(gaps: list[str] | None = None) -> LearningContextDTO:
@@ -259,6 +270,8 @@ class TestAnalyzeGapsTaskLogic:
     """
     Tests the analyze_gaps_task behavior using Celery's task.apply() API,
     which executes tasks eagerly (synchronously) without a broker.
+
+    All tests mock SessionLocal to avoid a real DB connection.
     """
 
     def _context(self) -> dict:
@@ -271,13 +284,61 @@ class TestAnalyzeGapsTaskLogic:
             "target_concept": "Feudalism",
         }
 
-    def test_with_gaps_calls_llm_and_returns_validated_result(self, monkeypatch):
-        """When the task is called, the LLM must be called and the result validated."""
+    def _mock_session_for_premium(self, monkeypatch):
+        """Patches SessionLocal to return a premium user from db.query()."""
+        from app.enums.enums import SubscriptionPlan
+        fake_user = MagicMock()
+        fake_user.subscription_plan = SubscriptionPlan.PREMIUM
+
+        fake_db = MagicMock()
+        fake_db.query.return_value.filter.return_value.first.return_value = fake_user
+
+        mock_session_cls = MagicMock()
+        mock_session_cls.return_value.__enter__ = MagicMock(return_value=fake_db)
+        mock_session_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        monkeypatch.setattr(
+            "app.modules.ai_orchestrator.tasks.SessionLocal", mock_session_cls
+        )
+
+    def _mock_session_for_free(self, monkeypatch):
+        """Patches SessionLocal to return a free user from db.query()."""
+        from app.enums.enums import SubscriptionPlan
+        fake_user = MagicMock()
+        fake_user.subscription_plan = SubscriptionPlan.FREE
+
+        fake_db = MagicMock()
+        fake_db.query.return_value.filter.return_value.first.return_value = fake_user
+
+        mock_session_cls = MagicMock()
+        mock_session_cls.return_value.__enter__ = MagicMock(return_value=fake_db)
+        mock_session_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        monkeypatch.setattr(
+            "app.modules.ai_orchestrator.tasks.SessionLocal", mock_session_cls
+        )
+
+    def _mock_session_user_not_found(self, monkeypatch):
+        """Patches SessionLocal so db.query() returns None (user not found)."""
+        fake_db = MagicMock()
+        fake_db.query.return_value.filter.return_value.first.return_value = None
+
+        mock_session_cls = MagicMock()
+        mock_session_cls.return_value.__enter__ = MagicMock(return_value=fake_db)
+        mock_session_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        monkeypatch.setattr(
+            "app.modules.ai_orchestrator.tasks.SessionLocal", mock_session_cls
+        )
+
+    def test_premium_user_calls_llm_and_returns_validated_result(self, monkeypatch):
+        """When a premium user calls the task, the LLM must be invoked and the result validated."""
         fake_llm_result = {
             "concept": "Feudalism",
             "explanation": "Student confuses feudal hierarchy.",
             "severity": "medio",
         }
+        self._mock_session_for_premium(monkeypatch)
         monkeypatch.setattr(
             "app.modules.ai_orchestrator.tasks.generate_structured_json",
             lambda sys_p, usr_p: fake_llm_result,
@@ -303,8 +364,60 @@ class TestAnalyzeGapsTaskLogic:
         assert data["concept"] == "Feudalism"
         assert data["severity"] == "medio"
 
+    def test_free_user_is_rejected_before_llm_call(self, monkeypatch):
+        """A free-plan user must be rejected with ValueError before any LLM call."""
+        self._mock_session_for_free(monkeypatch)
+        llm_spy = MagicMock()
+        monkeypatch.setattr(
+            "app.modules.ai_orchestrator.tasks.generate_structured_json", llm_spy
+        )
+        monkeypatch.setattr(
+            "app.modules.ai_orchestrator.tasks.get_redis_cache",
+            lambda: MagicMock(setex=MagicMock()),
+        )
+
+        from app.modules.ai_orchestrator.tasks import analyze_gaps_task
+
+        payload = AITaskPayload(
+            reference_id=TOPIC_ID,
+            user_id=USER_ID,
+            context=self._context(),
+            learning_context={"user_level": 2, "concept_gaps": ["Feudalism"]},
+            cache_key="",
+        )
+        result = analyze_gaps_task.apply(args=[payload.model_dump()])
+
+        assert result.failed()
+        llm_spy.assert_not_called()
+
+    def test_user_not_found_is_rejected(self, monkeypatch):
+        """If the user is not found in the DB, the task must fail immediately."""
+        self._mock_session_user_not_found(monkeypatch)
+        monkeypatch.setattr(
+            "app.modules.ai_orchestrator.tasks.generate_structured_json",
+            MagicMock(),
+        )
+        monkeypatch.setattr(
+            "app.modules.ai_orchestrator.tasks.get_redis_cache",
+            lambda: MagicMock(setex=MagicMock()),
+        )
+
+        from app.modules.ai_orchestrator.tasks import analyze_gaps_task
+
+        payload = AITaskPayload(
+            reference_id=TOPIC_ID,
+            user_id=USER_ID,
+            context=self._context(),
+            learning_context={"user_level": 2, "concept_gaps": ["Feudalism"]},
+            cache_key="",
+        )
+        result = analyze_gaps_task.apply(args=[payload.model_dump()])
+
+        assert result.failed()
+
     def test_llm_error_marks_task_as_failed(self, monkeypatch):
-        """If the LLM call raises an exception, the task must fail (not crash silently)."""
+        """If the LLM call raises an exception for a premium user, the task must fail."""
+        self._mock_session_for_premium(monkeypatch)
         monkeypatch.setattr(
             "app.modules.ai_orchestrator.tasks.generate_structured_json",
             MagicMock(side_effect=Exception("LLM timeout")),
@@ -686,10 +799,11 @@ class TestAIOrchestratorServiceExtra:
 
         assert result is None
 
-    def test_fetch_learning_context_returns_dto_when_facade_returns_data(
+    def test_fetch_learning_context_returns_dto_for_premium_user(
         self, monkeypatch
     ):
-        """When LearningFacade returns a context dict, it is parsed into LearningContextDTO."""
+        """A premium user gets their concept_gaps preserved in the LearningContextDTO."""
+        from app.enums.enums import SubscriptionPlan
         fake_ctx = {"user_level": 5, "concept_gaps": ["Feudalism"]}
         monkeypatch.setattr(
             "app.modules.ai_orchestrator.service.LearningFacade",
@@ -701,13 +815,45 @@ class TestAIOrchestratorServiceExtra:
         )
         redis_mock = MagicMock()
         service = self._make_service(redis_mock)
+
+        fake_premium_user = MagicMock()
+        fake_premium_user.subscription_plan = SubscriptionPlan.PREMIUM
         db_mock = MagicMock()
+        db_mock.query.return_value.filter.return_value.first.return_value = fake_premium_user
 
         result = service._fetch_learning_context(db_mock, USER_ID, TOPIC_ID)
 
         assert result is not None
         assert result.user_level == 5
         assert "Feudalism" in result.concept_gaps
+
+    def test_fetch_learning_context_clears_gaps_for_free_user(
+        self, monkeypatch
+    ):
+        """A free-plan user must have concept_gaps cleared in the LearningContextDTO."""
+        from app.enums.enums import SubscriptionPlan
+        fake_ctx = {"user_level": 3, "concept_gaps": ["Feudalism", "Crusades"]}
+        monkeypatch.setattr(
+            "app.modules.ai_orchestrator.service.LearningFacade",
+            MagicMock(
+                return_value=MagicMock(
+                    get_user_learning_context=MagicMock(return_value=fake_ctx)
+                )
+            ),
+        )
+        redis_mock = MagicMock()
+        service = self._make_service(redis_mock)
+
+        fake_free_user = MagicMock()
+        fake_free_user.subscription_plan = SubscriptionPlan.FREE
+        db_mock = MagicMock()
+        db_mock.query.return_value.filter.return_value.first.return_value = fake_free_user
+
+        result = service._fetch_learning_context(db_mock, USER_ID, TOPIC_ID)
+
+        assert result is not None
+        assert result.user_level == 3
+        assert result.concept_gaps == []
 
     def test_returns_failed_when_registry_raises_value_error(self, monkeypatch):
         """If the registry raises ValueError, service must return a failed response."""

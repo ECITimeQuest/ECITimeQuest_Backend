@@ -15,6 +15,8 @@ from app.modules.ai_orchestrator.schemas import (
     LearningContextDTO,
 )
 from app.modules.ai_orchestrator import tasks  # Trigger task registration
+from app.modules.auth.models import User
+from app.enums.enums import SubscriptionPlan
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,10 @@ class AIOrchestratorService:
                 user_id=user_id, topic_id=reference_id
             )
             if context_dict:
+                user = db.query(User).filter(User.id == user_id).first()
+                if user and user.subscription_plan != SubscriptionPlan.PREMIUM:
+                    context_dict["concept_gaps"] = []
+
                 return LearningContextDTO(**context_dict)
         except Exception:
             pass
