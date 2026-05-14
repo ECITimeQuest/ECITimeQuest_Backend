@@ -199,8 +199,21 @@ def submit_answer(db: Session, user_id: UUID, session_id: UUID, data: SubmitAnsw
     # Premium users do not lose lives when answering incorrectly
     user = get_user_by_id(db, user_id)
     is_premium_user = getattr(user, "subscription_plan", None) == SubscriptionPlan.PREMIUM
-    lives_lost = 0 if data.is_correct else (0 if is_premium_user else 1)
+    if data.is_correct or is_premium_user:
+        lives_lost = 0
+    else:
+        lives_lost = 1
     feedback = "Correct answer" if data.is_correct else "Review this concept and try again"
+
+    progress = get_or_create_progress(db, user_id)
+    if lives_lost > 0:
+        progress.lives = max(0, progress.lives - lives_lost)
+        if progress.lives < MAX_LIVES and not progress.lives_refill_at:
+            progress.lives_refill_at = datetime.now(timezone.utc) + timedelta(minutes=LIFE_REFILL_MINUTES)
+
+        if progress.lives <= 0:
+            session.finished_at = datetime.now(timezone.utc)
+            session.completed = False
 
     # normalize concept to avoid whitespace/case mismatches
     concept_norm = (data.concept or "").strip()
