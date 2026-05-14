@@ -70,3 +70,21 @@ def update_user_role(
 ):
     _require_admin(current_user, db)
     return service.update_user_role(db, user_id, data.role)
+
+
+@router.patch("/users/{user_id}/subscription", response_model=schemas.UserResponse, responses={
+    401: {"description": "Invalid or expired token"},
+    403: {"description": "Admin role required"},
+    404: {"description": "User not found"},
+    400: {"description": "Invalid subscription"},
+})
+@limiter.limit("10/minute")
+def update_user_subscription(
+    request: Request,
+    user_id: UUID,
+    data: schemas.UserSubscriptionUpdateRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    _require_admin(current_user, db)
+    return service.update_user_subscription(db, user_id, data.subscription_plan)

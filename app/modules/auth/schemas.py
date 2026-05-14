@@ -26,3 +26,7 @@ class UserResponse(BaseModel):
 
 class UserRoleUpdateRequest(BaseModel):
     role: UserRole
+
+
+class UserSubscriptionUpdateRequest(BaseModel):
+    subscription_plan: SubscriptionPlan

@@ -7,7 +7,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
 import logging
 
-from app.enums.enums import CoinReason, ErrorType
+from app.enums.enums import CoinReason, ErrorType, SubscriptionPlan
+from app.modules.auth.service import get_user_by_id
 from app.modules.content.models import Topic, HistoricalPeriod
 from app.modules.learning.models import (
     UserProgress, TopicProgress, LearningSession,
@@ -112,6 +113,11 @@ def _apply_session_completion(
 
     xp_gained, coins_gained, lives_lost = _compute_session_outcome(data, progress.lives)
 
+    # Premium users do not lose lives
+    user = get_user_by_id(db, user_id)
+    if getattr(user, "subscription_plan", None) == SubscriptionPlan.PREMIUM:
+        lives_lost = 0
+
     session.xp_gained = xp_gained
     session.coins_gained = coins_gained
     session.lives_lost = lives_lost
@@ -190,7 +196,10 @@ def submit_answer(db: Session, user_id: UUID, session_id: UUID, data: SubmitAnsw
 
     xp_earned = XP_PER_CORRECT_ANSWER if data.is_correct else 0
     coins_earned = COINS_PER_CORRECT_ANSWER if data.is_correct else 0
-    lives_lost = 0 if data.is_correct else 1
+    # Premium users do not lose lives when answering incorrectly
+    user = get_user_by_id(db, user_id)
+    is_premium_user = getattr(user, "subscription_plan", None) == SubscriptionPlan.PREMIUM
+    lives_lost = 0 if data.is_correct else (0 if is_premium_user else 1)
     feedback = "Correct answer" if data.is_correct else "Review this concept and try again"
 
     # normalize concept to avoid whitespace/case mismatches
