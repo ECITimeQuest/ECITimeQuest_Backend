@@ -120,14 +120,23 @@ def _apply_session_completion(
 
     session.xp_gained = xp_gained
     session.coins_gained = coins_gained
-    session.lives_lost = lives_lost
     session.completed = data.completed
     session.finished_at = finished_at or datetime.now(timezone.utc)
 
+    # Determine if this is an offline sync:
+    # - finished_at is provided (non-None) = offline sync = deduct lives here
+    # - finished_at is None = online quiz = lives already deducted in submit_answer
+    is_offline_sync = finished_at is not None
+    
+    if is_offline_sync:
+        # Offline sync: session.lives_lost not yet set, calculate and deduct now
+        session.lives_lost = lives_lost
+        progress.lives = max(0, progress.lives - lives_lost)
+    # else: online quiz, lives_lost already accumulated in session.lives_lost via submit_answer
+    
     progress.xp_total += xp_gained
     progress.level = _calculate_level(progress.xp_total)
     progress.coins += coins_gained
-    progress.lives = max(0, progress.lives - lives_lost)
     _update_streak(progress)
 
     if progress.lives < MAX_LIVES and not progress.lives_refill_at:
