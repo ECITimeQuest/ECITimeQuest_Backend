@@ -134,6 +134,25 @@ def test_create_user_conflict_by_firebase_uid():
 	db.rollback.assert_called_once()
 
 
+def test_update_user_subscription_refills_lives_on_premium_upgrade(monkeypatch):
+	from app.enums.enums import SubscriptionPlan
+
+	db = MagicMock()
+	user = SimpleNamespace(id=uuid4(), subscription_plan=SubscriptionPlan.FREE)
+	progress = SimpleNamespace(lives=2, lives_refill_at=datetime.now(timezone.utc))
+
+	monkeypatch.setattr(service, "get_user_by_id", lambda db, user_id: user)
+	db.query.return_value.filter.return_value.first.return_value = progress
+
+	result = service.update_user_subscription(db, user.id, SubscriptionPlan.PREMIUM)
+
+	assert result.subscription_plan == SubscriptionPlan.PREMIUM
+	assert progress.lives == 5
+	assert progress.lives_refill_at is None
+	db.commit.assert_called_once()
+	db.refresh.assert_called_once_with(user)
+
+
 def test_upsert_user_from_token_reconciles_existing_email(monkeypatch):
 	db = MagicMock()
 	existing = SimpleNamespace(
