@@ -224,10 +224,6 @@ def submit_answer(db: Session, user_id: UUID, session_id: UUID, data: SubmitAnsw
         # update session cumulative lives_lost so UI can show total lost so far
         session.lives_lost = (session.lives_lost or 0) + lives_lost
 
-        if progress.lives <= 0:
-            session.finished_at = datetime.now(timezone.utc)
-            session.completed = False
-
     # normalize concept to avoid whitespace/case mismatches
     concept_norm = (data.concept or "").strip()
     if not data.is_correct:
