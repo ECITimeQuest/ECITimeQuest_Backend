@@ -22,6 +22,51 @@ class UserProgressResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ── Era / Period Progress ─────────────────────────────────
+
+class EraTopicProgressItem(BaseModel):
+    topic_id: UUID
+    name: str
+    completion_percentage: float
+    xp_earned: int
+
+
+class EraProgressResponse(BaseModel):
+    period_id: UUID
+    period_name: str
+    topics_count: int
+    topics_completed: int
+    xp_total: int
+    avg_completion: float
+    topics: list[EraTopicProgressItem] | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class EraMasteryItemResponse(BaseModel):
+    period_id: UUID
+    period_name: str
+    mastery_percentage: float
+    topics_count: int
+    topics_completed: int
+    xp_total: int
+
+
+class LearningHomeSummaryEraResponse(BaseModel):
+    period_id: UUID
+    period_name: str
+    last_studied_at: datetime
+    completion_percentage: float
+
+    model_config = {"from_attributes": True}
+
+
+class LearningHomeSummaryResponse(BaseModel):
+    last_studied_era: Optional[LearningHomeSummaryEraResponse] = None
+    completed_eras_count: int
+    total_eras_count: int
+
+
 # ── TopicProgress ─────────────────────────────────────────
 class TopicProgressResponse(BaseModel):
     id: UUID
@@ -41,6 +86,7 @@ class StartSessionRequest(BaseModel):
 class SubmitAnswerRequest(BaseModel):
     session_id: UUID
     question_id: UUID
+    concept: str = Field(..., min_length=2)
     answer: str = Field(min_length=1)
     response_time_ms: int = Field(ge=0)
     is_correct: bool
@@ -114,6 +160,7 @@ class ConceptGapResponse(BaseModel):
     id: UUID
     user_id: UUID
     topic_id: UUID
+    topic_name: Optional[str] = None
     concept: str
     error_type: ErrorType
     weakness_score: float

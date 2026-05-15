@@ -70,3 +70,28 @@ def update_user_role(
 ):
     _require_admin(current_user, db)
     return service.update_user_role(db, user_id, data.role)
+
+
+@router.patch("/users/{user_id}/subscription", response_model=schemas.UserResponse, responses={
+    401: {"description": "Invalid or expired token"},
+    403: {"description": "Cannot modify another user's subscription"},
+    404: {"description": "User not found"},
+    400: {"description": "Invalid subscription"},
+})
+@limiter.limit("10/minute")
+def update_user_subscription(
+    request: Request,
+    user_id: UUID,
+    data: schemas.UserSubscriptionUpdateRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    # Allow user to change their own subscription or admin to change anyone's
+    current_user_obj = service.get_user_by_firebase_uid(db, current_user["uid"])
+    is_admin = current_user_obj and current_user_obj.role == UserRole.ADMIN
+    is_own_subscription = current_user_obj and current_user_obj.id == user_id
+    
+    if not (is_admin or is_own_subscription):
+        raise HTTPException(status_code=403, detail="Cannot modify another user's subscription")
+    
+    return service.update_user_subscription(db, user_id, data.subscription_plan)

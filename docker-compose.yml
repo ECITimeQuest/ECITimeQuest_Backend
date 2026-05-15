@@ -1,6 +1,21 @@
 services:
+  db:
+    image: postgres:15-alpine
+    container_name: timequest_db_local
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=timequest_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - timequest_network
+
   api:
     build: .
+    container_name: timequest_api_local
     command: >
       sh -c "
       until alembic upgrade head; do
@@ -16,22 +31,47 @@ services:
     env_file:
       - .env
     depends_on:
-      db:
-        condition: service_healthy
+      - db
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379/1
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    networks:
+      - timequest_network
 
-  db:
-    image: postgres:16
+  celery_worker:
+    build: .
+    container_name: timequest_worker_local
+    command: celery -A app.workers.celery_app worker --loglevel=info
+    volumes:
+      - .:/app
     env_file:
       - .env
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+    environment:
+      - REDIS_URL=redis://redis:6379/1
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    networks:
+      - timequest_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: timequest_redis_local
     ports:
-      - "5432:5432"
+      - "6379:6379"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - redis_data:/data
+    networks:
+      - timequest_network
+
+networks:
+  timequest_network:
+    driver: bridge
 
 volumes:
   postgres_data:
+  redis_data:

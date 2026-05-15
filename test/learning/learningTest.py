@@ -24,6 +24,9 @@ from app.modules.learning.schemas import (
 )
 
 
+HISTORIA_ANTIGUA = "Historia Antigua"
+
+
 class QuerySequence(list):
 	pass
 
@@ -33,6 +36,9 @@ class FakeQuery:
 		self.result = result
 
 	def filter(self, *args, **kwargs):
+		return self
+
+	def order_by(self, *args, **kwargs):
 		return self
 
 	def first(self):
@@ -52,9 +58,21 @@ class FakeDB:
 	def __init__(self, results=None):
 		self.results = results or {}
 		self.add = MagicMock()
+		self.delete = MagicMock()
 		self.commit = MagicMock()
 		self.refresh = MagicMock()
 		self.rollback = MagicMock()
+		self.flush = MagicMock()
+
+	def begin_nested(self):
+		class _Tx:
+			def __enter__(self_inner):
+				return self_inner
+
+			def __exit__(self_inner, exc_type, exc, tb):
+				return False
+
+		return _Tx()
 
 	def query(self, model):
 		key = model.__name__
@@ -222,6 +240,7 @@ def test_submit_answer_correct_returns_rewards():
 		SubmitAnswerRequest(
 			session_id=session.id,
 			question_id=uuid4(),
+			concept="timeline",
 			answer="answer",
 			response_time_ms=1200,
 			is_correct=True,
@@ -236,6 +255,33 @@ def test_submit_answer_correct_returns_rewards():
 	assert db.add.call_count == 0
 
 
+def test_submit_answer_correct_removes_resolved_gap():
+	user_id = uuid4()
+	topic_id = uuid4()
+	session = _session(user_id, topic_id)
+	existing_gap = _gap(user_id, topic_id)
+	existing_gap.concept = "timeline"
+	db = FakeDB({"LearningSession": session, "ConceptGap": existing_gap})
+
+	result = service.submit_answer(
+		db,
+		user_id,
+		session.id,
+		SubmitAnswerRequest(
+			session_id=session.id,
+			question_id=uuid4(),
+			concept="timeline",
+			answer="answer",
+			response_time_ms=1200,
+			is_correct=True,
+		),
+	)
+
+	assert result.is_correct is True
+	db.delete.assert_called_once_with(existing_gap)
+	assert db.commit.call_count >= 1
+
+
 def test_submit_answer_wrong_creates_concept_gap():
 	user_id = uuid4()
 	session = _session(user_id, uuid4())
@@ -248,6 +294,7 @@ def test_submit_answer_wrong_creates_concept_gap():
 		SubmitAnswerRequest(
 			session_id=session.id,
 			question_id=uuid4(),
+			concept="timeline",
 			answer="wrong",
 			response_time_ms=9000,
 			is_correct=False,
@@ -273,6 +320,7 @@ def test_submit_answer_session_not_found():
 			SubmitAnswerRequest(
 				session_id=uuid4(),
 				question_id=uuid4(),
+				concept="timeline",
 				answer="x",
 				response_time_ms=1000,
 				is_correct=True,
@@ -564,7 +612,7 @@ def test_router_submit_answer_success(app_client: TestClient, monkeypatch):
 
 	response = app_client.post(
 		f"/learning/sessions/{session.id}/answers",
-		json={"session_id": str(session.id), "question_id": str(uuid4()), "answer": "ans", "response_time_ms": 1000, "is_correct": True},
+		json={"session_id": str(session.id), "question_id": str(uuid4()), "concept": "timeline", "answer": "ans", "response_time_ms": 1000, "is_correct": True},
 	)
 
 	assert response.status_code == 200
@@ -578,7 +626,7 @@ def test_router_submit_answer_not_found(app_client: TestClient, monkeypatch):
 
 	response = app_client.post(
 		f"/learning/sessions/{uuid4()}/answers",
-		json={"session_id": str(uuid4()), "question_id": str(uuid4()), "answer": "ans", "response_time_ms": 1000, "is_correct": True},
+		json={"session_id": str(uuid4()), "question_id": str(uuid4()), "concept": "timeline", "answer": "ans", "response_time_ms": 1000, "is_correct": True},
 	)
 
 	assert response.status_code == 404
@@ -618,8 +666,10 @@ def test_router_get_gaps_and_badges_routes(app_client: TestClient, monkeypatch):
 	monkeypatch.setattr(learning_router, "get_user_by_firebase_uid", lambda db, uid: user)
 
 	db = MagicMock()
+	# Simulate three queries: ConceptGap, Topic (id,name), UserBadge
 	db.query.side_effect = [
 		MagicMock(filter=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[gap])))),
+		MagicMock(filter=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[(gap.topic_id, "Topic X")])))),
 		MagicMock(filter=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[badge])))),
 	]
 
@@ -635,3 +685,110 @@ def test_router_get_gaps_and_badges_routes(app_client: TestClient, monkeypatch):
 	assert badges_response.status_code == 200
 	assert gaps_response.json()[0]["id"] == str(gap.id)
 	assert badges_response.json()[0]["id"] == str(badge.id)
+
+
+def test_router_get_period_progress_success(app_client: TestClient, monkeypatch):
+	user = _user()
+	period_id = uuid4()
+	sample = {
+		"period_id": str(period_id),
+		"period_name": "Ancient Era",
+		"topics_count": 2,
+		"topics_completed": 1,
+		"xp_total": 150,
+		"avg_completion": 50.0,
+		"topics": [
+			{"topic_id": str(uuid4()), "name": "Topic A", "completion_percentage": 100.0, "xp_earned": 100},
+			{"topic_id": str(uuid4()), "name": "Topic B", "completion_percentage": 0.0, "xp_earned": 50},
+		],
+	}
+
+	monkeypatch.setattr(learning_router.service, "get_progress_by_period", lambda db, user_id, pid, include_topics=True: sample)
+	monkeypatch.setattr(learning_router, "get_user_by_firebase_uid", lambda db, uid: user)
+
+	response = app_client.get(f"/learning/periods/{period_id}/progress")
+
+	assert response.status_code == 200
+	assert response.json()["period_name"] == "Ancient Era"
+	assert response.json()["topics_count"] == 2
+
+
+def test_router_get_periods_mastery_success(app_client: TestClient, monkeypatch):
+	user = _user()
+	period_id = uuid4()
+	mastery = [
+		{
+			"period_id": str(period_id),
+			"period_name": HISTORIA_ANTIGUA,
+			"mastery_percentage": 90.0,
+			"topics_count": 5,
+			"topics_completed": 3,
+			"xp_total": 420,
+		}
+	]
+
+	monkeypatch.setattr(learning_router.service, "get_periods_mastery", lambda db, user_id: mastery)
+	monkeypatch.setattr(learning_router, "get_user_by_firebase_uid", lambda db, uid: user)
+
+	response = app_client.get("/learning/periods/mastery")
+
+	assert response.status_code == 200
+	assert len(response.json()) == 1
+	assert response.json()[0]["period_name"] == HISTORIA_ANTIGUA
+	assert response.json()[0]["mastery_percentage"] == pytest.approx(90.0)
+
+
+def test_get_home_summary_computes_last_studied_era_and_completed_count():
+	user_id = uuid4()
+	period_id = uuid4()
+	latest_progress = SimpleNamespace(
+		id=uuid4(),
+		user_id=user_id,
+		topic_id=uuid4(),
+		completion_percentage=100.0,
+		xp_earned=120,
+		last_studied_at=datetime.now(timezone.utc),
+	)
+	topic = SimpleNamespace(id=latest_progress.topic_id, period_id=period_id, is_active=True, is_published=True)
+	period = SimpleNamespace(id=period_id, name=HISTORIA_ANTIGUA, is_active=True, is_published=True)
+	db = FakeDB({"TopicProgress": latest_progress, "Topic": topic, "HistoricalPeriod": period})
+
+	original_get_periods_mastery = service.get_periods_mastery
+	service.get_periods_mastery = lambda db, uid: [
+		{"period_id": period_id, "period_name": HISTORIA_ANTIGUA, "mastery_percentage": 100.0, "topics_count": 3, "topics_completed": 3, "xp_total": 360},
+		{"period_id": uuid4(), "period_name": "Edad Media", "mastery_percentage": 50.0, "topics_count": 2, "topics_completed": 1, "xp_total": 120},
+	]  # type: ignore[assignment]
+	try:
+		result = service.get_home_summary(db, user_id)
+	finally:
+		service.get_periods_mastery = original_get_periods_mastery  # type: ignore[assignment]
+
+	assert result["completed_eras_count"] == 1
+	assert result["total_eras_count"] == 2
+	assert result["last_studied_era"]["period_name"] == HISTORIA_ANTIGUA
+	assert result["last_studied_era"]["completion_percentage"] == pytest.approx(100.0)
+
+
+def test_router_get_home_summary_success(app_client: TestClient, monkeypatch):
+	user = _user()
+	period_id = uuid4()
+	sample = {
+		"last_studied_era": {
+			"period_id": str(period_id),
+			"period_name": HISTORIA_ANTIGUA,
+			"last_studied_at": datetime.now(timezone.utc).isoformat(),
+			"completion_percentage": 88.5,
+		},
+		"completed_eras_count": 2,
+		"total_eras_count": 5,
+	}
+
+	monkeypatch.setattr(learning_router.service, "get_home_summary", lambda db, user_id: sample)
+	monkeypatch.setattr(learning_router, "get_user_by_firebase_uid", lambda db, uid: user)
+
+	response = app_client.get("/learning/home-summary")
+
+	assert response.status_code == 200
+	assert response.json()["completed_eras_count"] == 2
+	assert response.json()["last_studied_era"]["period_name"] == HISTORIA_ANTIGUA
+
