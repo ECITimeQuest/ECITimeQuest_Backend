@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.enums.enums import UserRole, SubscriptionPlan
 from app.modules.auth.models import User
 from app.modules.auth.schemas import UserCreate
+from app.modules.learning.models import UserProgress
 
 
 def _raise_user_integrity_error(exc: IntegrityError) -> None:
@@ -161,10 +162,18 @@ def update_user_subscription(db: Session, user_id: UUID, new_plan: SubscriptionP
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if getattr(user, "subscription_plan", None) == new_plan:
+    current_plan = getattr(user, "subscription_plan", None)
+    if current_plan == new_plan:
         return user
 
     user.subscription_plan = new_plan
+
+    if current_plan != SubscriptionPlan.PREMIUM and new_plan == SubscriptionPlan.PREMIUM:
+        progress = db.query(UserProgress).filter(UserProgress.user_id == user.id).first()
+        if progress:
+            progress.lives = 5
+            progress.lives_refill_at = None
+
     return _commit_user_changes(db, user)
 
 
