@@ -1,6 +1,29 @@
 services:
+  db:
+    image: postgres:15-alpine
+    container_name: timequest_db_local
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=timequest_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - timequest_network
+
   api:
     build: .
+    container_name: timequest_api_local
+    command: >
+      sh -c "
+      until alembic upgrade head; do
+        echo 'Waiting for database and retrying migrations...';
+        sleep 2;
+      done;
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      "
     ports:
       - "8000:8000"
     volumes:
@@ -9,15 +32,46 @@ services:
       - .env
     depends_on:
       - db
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379/1
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    networks:
+      - timequest_network
 
-  db:
-    image: postgres:16
+  celery_worker:
+    build: .
+    container_name: timequest_worker_local
+    command: celery -A app.workers.celery_app worker --loglevel=info
+    volumes:
+      - .:/app
     env_file:
       - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/1
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    networks:
+      - timequest_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: timequest_redis_local
     ports:
-      - "5432:5432"
+      - "6379:6379"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - redis_data:/data
+    networks:
+      - timequest_network
+
+networks:
+  timequest_network:
+    driver: bridge
 
 volumes:
   postgres_data:
+  redis_data:

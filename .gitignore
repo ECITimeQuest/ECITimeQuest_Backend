@@ -1,5 +1,6 @@
 # Variables de entorno
 .env
+.env.*
 
 # Python
 __pycache__/
@@ -15,4 +16,12 @@ postgres_data/
 .vscode/
 
 # pytest
+.coverage
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
 .pytest_cache/
+
+# Firebase
+firebase-credentials.json
