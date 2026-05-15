@@ -207,9 +207,13 @@ def submit_answer(db: Session, user_id: UUID, session_id: UUID, data: SubmitAnsw
 
     progress = get_or_create_progress(db, user_id)
     if lives_lost > 0:
+        # decrement user lives and persist
         progress.lives = max(0, progress.lives - lives_lost)
         if progress.lives < MAX_LIVES and not progress.lives_refill_at:
             progress.lives_refill_at = datetime.now(timezone.utc) + timedelta(minutes=LIFE_REFILL_MINUTES)
+
+        # update session cumulative lives_lost so UI can show total lost so far
+        session.lives_lost = (session.lives_lost or 0) + lives_lost
 
         if progress.lives <= 0:
             session.finished_at = datetime.now(timezone.utc)
@@ -236,6 +240,16 @@ def submit_answer(db: Session, user_id: UUID, session_id: UUID, data: SubmitAnsw
                 logger.debug("Removed resolved gap: user=%s topic=%s concept=%s", user_id, session.topic_id, concept_norm)
         except Exception:
             logger.exception("Error removing gap for user=%s topic=%s concept=%s", user_id, session.topic_id, concept_norm)
+    # persist progress and session so frontend sees updated lives immediately
+    try:
+        db.add(progress)
+        db.add(session)
+        db.commit()
+        db.refresh(progress)
+        db.refresh(session)
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to persist session/progress after submit_answer for user=%s session=%s", user_id, session_id)
 
     return AnswerSubmitResponse(
         session_id=session_id,
