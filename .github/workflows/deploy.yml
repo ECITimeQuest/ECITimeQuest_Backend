@@ -1,0 +1,57 @@
+name: Deploy to Azure Container Apps
+
+on:
+  push:
+    branches:
+      - main # Se ejecuta cuando haces push o merge a la rama 'main'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Descargar el código del repositorio
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Iniciar sesión en Azure usando un Service Principal
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 3. Iniciar sesión en el Azure Container Registry (ACR)
+      - name: Log in to ACR
+        run: |
+          az acr login --name ecitimequestregistry
+
+      # 4. Construir y subir la imagen de Docker a ACR
+      - name: Build and push Docker image
+        run: |
+          # Construimos la imagen localmente con tags: unique SHA y latest
+          docker build -t ecitimequestregistry.azurecr.io/backend:${{ github.sha }} .
+          docker tag ecitimequestregistry.azurecr.io/backend:${{ github.sha }} ecitimequestregistry.azurecr.io/backend:latest
+
+          # Subimos ambas imágenes
+          docker push ecitimequestregistry.azurecr.io/backend:${{ github.sha }}
+          docker push ecitimequestregistry.azurecr.io/backend:latest
+
+      # 5. Actualizar la Container App de la API con la nueva imagen
+      - name: Deploy API Container App
+        run: |
+          az containerapp update \
+            --name timequest-api \
+            --resource-group ecitimequest-rg \
+            --image ecitimequestregistry.azurecr.io/backend:${{ github.sha }}
+
+      # 6. Actualizar la Container App del Worker con la nueva imagen
+      - name: Deploy Worker Container App
+        run: |
+          az containerapp update \
+            --name timequest-worker \
+            --resource-group ecitimequest-rg \
+            --image ecitimequestregistry.azurecr.io/backend:${{ github.sha }}
