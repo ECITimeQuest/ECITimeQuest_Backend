@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from openai import RateLimitError, APIConnectionError
 from app.modules.ai_orchestrator.schemas import (
     AITaskPayload,
+    AITaskResponse,
     AnswerExplanationContext,
     AnswerExplanationGeneratedResponse,
     LearningContextDTO,
@@ -42,9 +43,32 @@ def _save_to_cache(cache_key: str, data: dict, ttl: int = 21600):
         redis_client.setex(cache_key, ttl, json.dumps(data))
 
 
-def _validate_and_return(result: dict, response_model, cache_key: str):
+def _publish_result(task_id: str, status: str, data: dict = None, error: str = None):
+    if not task_id:
+        return
+
+    redis_client = get_redis_cache()
+    response = AITaskResponse(
+        status=status, task_id=task_id, source="computed", data=data, error=error
+    )
+
+    redis_client.publish(f"ai_task_status:{task_id}", response.model_dump_json())
+
+
+def _publish_failure(task_instance, exc):
+    if (
+        task_instance.request.id
+        and task_instance.request.retries >= task_instance.max_retries
+    ):
+        _publish_result(task_instance.request.id, "failed", error=str(exc))
+
+
+def _validate_and_return(task_id: str, result: dict, response_model, cache_key: str):
     validated_result = response_model(**result)
+
     _save_to_cache(cache_key, validated_result.model_dump())
+    _publish_result(task_id, "completed", data=validated_result.model_dump())
+
     return validated_result.model_dump()
 
 
@@ -67,6 +91,7 @@ def generate_quiz_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     Saves the result in the domain cache.
     """
     p = AITaskPayload(**payload)
+
     logger.info(
         f"Starting generate_quiz_task for reference_id: {p.reference_id}, user_id: {p.user_id}"
     )
@@ -88,9 +113,12 @@ def generate_quiz_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
             f"Successfully generated and cached quiz for {p.reference_id} / {p.user_id}"
         )
 
-        return _validate_and_return(result, QuizGeneratedResponse, p.cache_key)
+        return _validate_and_return(
+            self.request.id, result, QuizGeneratedResponse, p.cache_key
+        )
     except Exception as e:
         logger.error(f"Error in generate_quiz_task for {p.reference_id}: {str(e)}")
+        _publish_failure(self, e)
         raise self.retry(exc=e)
 
 
@@ -135,9 +163,12 @@ def analyze_gaps_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         result = generate_structured_json(system_prompt, user_prompt)
         logger.info(f"Successfully analyzed gap for {p.reference_id} / {p.user_id}")
 
-        return _validate_and_return(result, GapAnalysisResponse, p.cache_key)
+        return _validate_and_return(
+            self.request.id, result, GapAnalysisResponse, p.cache_key
+        )
     except Exception as e:
         logger.error(f"Error in analyze_gaps_task for {p.reference_id}: {str(e)}")
+        _publish_failure(self, e)
         raise self.retry(exc=e)
 
 
@@ -171,13 +202,15 @@ def expand_content_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
             topic_ctx, learning_ctx
         )
         result = generate_structured_json(system_prompt, user_prompt)
+
         logger.info(f"Successfully expanded content for {p.reference_id} / {p.user_id}")
 
         return _validate_and_return(
-            result, ContentExpansionGeneratedResponse, p.cache_key
+            self.request.id, result, ContentExpansionGeneratedResponse, p.cache_key
         )
     except Exception as e:
         logger.error(f"Error in expand_content_task for {p.reference_id}: {str(e)}")
+        _publish_failure(self, e)
         raise self.retry(exc=e)
 
 
@@ -220,8 +253,9 @@ def explain_answer_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         return _validate_and_return(
-            result, AnswerExplanationGeneratedResponse, p.cache_key
+            self.request.id, result, AnswerExplanationGeneratedResponse, p.cache_key
         )
     except Exception as e:
         logger.error(f"Error in explain_answer_task for {p.reference_id}: {str(e)}")
+        _publish_failure(self, e)
         raise self.retry(exc=e)

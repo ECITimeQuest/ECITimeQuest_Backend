@@ -1,5 +1,7 @@
+import json
 from typing import Annotated
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.core.security import get_current_user
@@ -51,3 +53,14 @@ def get_task_status(task_id: str):
         return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/task/{task_id}/stream")
+async def stream_task_status(task_id: str):
+    """
+    Streams the status and result of an AI task by its ID using Server-Sent Events (SSE).
+    """
+    return StreamingResponse(
+        orchestrator_service.stream_task_status(task_id), 
+        media_type="text/event-stream"
+    )

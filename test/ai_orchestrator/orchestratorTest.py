@@ -60,6 +60,7 @@ AUTH_LOOKUP_PATH = "app.modules.ai_orchestrator.router.get_user_by_firebase_uid"
 
 def _fake_user():
     from app.enums.enums import SubscriptionPlan
+
     user = MagicMock(id=USER_ID)
     user.subscription_plan = SubscriptionPlan.FREE
     return user
@@ -67,6 +68,7 @@ def _fake_user():
 
 def _fake_premium_user():
     from app.enums.enums import SubscriptionPlan
+
     user = MagicMock(id=USER_ID)
     user.subscription_plan = SubscriptionPlan.PREMIUM
     return user
@@ -287,6 +289,7 @@ class TestAnalyzeGapsTaskLogic:
     def _mock_session_for_premium(self, monkeypatch):
         """Patches SessionLocal to return a premium user from db.query()."""
         from app.enums.enums import SubscriptionPlan
+
         fake_user = MagicMock()
         fake_user.subscription_plan = SubscriptionPlan.PREMIUM
 
@@ -304,6 +307,7 @@ class TestAnalyzeGapsTaskLogic:
     def _mock_session_for_free(self, monkeypatch):
         """Patches SessionLocal to return a free user from db.query()."""
         from app.enums.enums import SubscriptionPlan
+
         fake_user = MagicMock()
         fake_user.subscription_plan = SubscriptionPlan.FREE
 
@@ -729,6 +733,23 @@ class TestAITaskRouter:
         assert response.status_code == 200
         assert response.json()["status"] == "processing"
 
+    def test_stream_task_status(self, app_client: TestClient, monkeypatch):
+        task_id = str(uuid4())
+
+        async def fake_stream():
+            yield f'data: {{"status": "completed"}}\n\n'
+
+        monkeypatch.setattr(
+            "app.modules.ai_orchestrator.router.orchestrator_service.stream_task_status",
+            lambda tid: fake_stream(),
+        )
+
+        response = app_client.get(f"/ai/task/{task_id}/stream")
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        assert 'data: {"status": "completed"}' in response.text
+
     def test_post_task_raises_500_on_unexpected_error(
         self, app_client: TestClient, monkeypatch
     ):
@@ -799,11 +820,10 @@ class TestAIOrchestratorServiceExtra:
 
         assert result is None
 
-    def test_fetch_learning_context_returns_dto_for_premium_user(
-        self, monkeypatch
-    ):
+    def test_fetch_learning_context_returns_dto_for_premium_user(self, monkeypatch):
         """A premium user gets their concept_gaps preserved in the LearningContextDTO."""
         from app.enums.enums import SubscriptionPlan
+
         fake_ctx = {"user_level": 5, "concept_gaps": ["Feudalism"]}
         monkeypatch.setattr(
             "app.modules.ai_orchestrator.service.LearningFacade",
@@ -819,7 +839,9 @@ class TestAIOrchestratorServiceExtra:
         fake_premium_user = MagicMock()
         fake_premium_user.subscription_plan = SubscriptionPlan.PREMIUM
         db_mock = MagicMock()
-        db_mock.query.return_value.filter.return_value.first.return_value = fake_premium_user
+        db_mock.query.return_value.filter.return_value.first.return_value = (
+            fake_premium_user
+        )
 
         result = service._fetch_learning_context(db_mock, USER_ID, TOPIC_ID)
 
@@ -827,11 +849,10 @@ class TestAIOrchestratorServiceExtra:
         assert result.user_level == 5
         assert "Feudalism" in result.concept_gaps
 
-    def test_fetch_learning_context_clears_gaps_for_free_user(
-        self, monkeypatch
-    ):
+    def test_fetch_learning_context_clears_gaps_for_free_user(self, monkeypatch):
         """A free-plan user must have concept_gaps cleared in the LearningContextDTO."""
         from app.enums.enums import SubscriptionPlan
+
         fake_ctx = {"user_level": 3, "concept_gaps": ["Feudalism", "Crusades"]}
         monkeypatch.setattr(
             "app.modules.ai_orchestrator.service.LearningFacade",
@@ -847,7 +868,9 @@ class TestAIOrchestratorServiceExtra:
         fake_free_user = MagicMock()
         fake_free_user.subscription_plan = SubscriptionPlan.FREE
         db_mock = MagicMock()
-        db_mock.query.return_value.filter.return_value.first.return_value = fake_free_user
+        db_mock.query.return_value.filter.return_value.first.return_value = (
+            fake_free_user
+        )
 
         result = service._fetch_learning_context(db_mock, USER_ID, TOPIC_ID)
 
@@ -949,6 +972,84 @@ class TestAIOrchestratorServiceExtra:
 
         assert response.status == "processing"
 
+    @pytest.mark.asyncio
+    async def test_stream_task_status_already_completed(self, monkeypatch):
+        """stream_task_status should yield immediately and return if the task is already completed."""
+        redis_mock = MagicMock()
+        service = self._make_service(redis_mock)
+
+        monkeypatch.setattr(
+            service,
+            "get_task_status",
+            lambda tid: MagicMock(
+                status="completed", model_dump_json=lambda: '{"status": "completed"}'
+            ),
+        )
+
+        generator = service.stream_task_status("some-id")
+        events = [event async for event in generator]
+
+        assert len(events) == 1
+        assert 'data: {"status": "completed"}' in events[0]
+        # Redis should not be subscribed to since it returned early
+        redis_mock.pubsub.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_task_status_redis_subscription(self, monkeypatch):
+        """stream_task_status should subscribe to Redis Pub/Sub, listen to messages, and close connections properly."""
+        redis_mock = MagicMock()
+        service = self._make_service(redis_mock)
+
+        # 1. Mock get_task_status to return processing
+        monkeypatch.setattr(
+            service,
+            "get_task_status",
+            lambda tid: MagicMock(
+                status="processing", model_dump_json=lambda: '{"status": "processing"}'
+            ),
+        )
+
+        # 2. Mock redis.asyncio.from_url to simulate Redis stream
+        mock_pubsub = MagicMock()
+
+        async def fake_listen():
+            # First message with invalid JSON to cover except block
+            yield {"type": "message", "data": "invalid json"}
+            # Second message with completed status to break loop
+            yield {
+                "type": "message",
+                "data": '{"status": "completed", "task_id": "some-id"}',
+            }
+
+        mock_pubsub.listen = fake_listen
+
+        # Async mocks
+        async def fake_async():
+            pass
+
+        async def fake_async_sub(channel):
+            pass
+
+        mock_pubsub.subscribe = fake_async_sub
+        mock_pubsub.unsubscribe = fake_async
+
+        mock_redis_async = MagicMock()
+        mock_redis_async.pubsub.return_value = mock_pubsub
+        mock_redis_async.aclose = fake_async
+
+        monkeypatch.setattr(
+            "app.modules.ai_orchestrator.service.aioredis.from_url",
+            lambda url, **kwargs: mock_redis_async,
+        )
+
+        generator = service.stream_task_status("some-id")
+        events = [event async for event in generator]
+
+        assert len(events) == 3
+        assert "processing" in events[0]
+        assert "invalid json" in events[1]
+        assert "completed" in events[2]
+
 
 # ---------------------------------------------------------------------------
 # 7. generate_quiz_task and expand_content_task Tests (missing L67-88, L168-186)
@@ -963,6 +1064,12 @@ class TestGenerateQuizTask:
             "key_facts": ["Pope Urban II called for it", "Started in 1096"],
             "fun_fact": "Crusaders called enemies 'Saracens'.",
         }
+
+    def test_publish_result_with_empty_task_id(self):
+        """_publish_result must return early without doing anything when task_id is empty."""
+        from app.modules.ai_orchestrator.tasks import _publish_result
+
+        _publish_result("", "completed")
 
     def test_success_returns_validated_quiz(self, monkeypatch):
         """generate_quiz_task must call the LLM and return a validated quiz."""

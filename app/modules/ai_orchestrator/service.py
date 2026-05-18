@@ -1,9 +1,11 @@
 import json
 import hashlib
 import logging
-from typing import Optional
+import redis.asyncio as aioredis
+from typing import Optional, AsyncGenerator
 from sqlalchemy.orm import Session
 from celery.result import AsyncResult
+from app.config import settings
 from app.modules.learning.facade import LearningFacade
 from app.modules.ai_orchestrator.registry import AITaskRegistry
 from app.modules.ai_orchestrator.services.redis_cache import get_redis_cache
@@ -31,6 +33,7 @@ class AIOrchestratorService:
             context_dict = learning_facade.get_user_learning_context(
                 user_id=user_id, topic_id=reference_id
             )
+
             if context_dict:
                 user = db.query(User).filter(User.id == user_id).first()
                 if user and user.subscription_plan != SubscriptionPlan.PREMIUM:
@@ -52,6 +55,7 @@ class AIOrchestratorService:
                 status="failed",
                 error="The 'context' field is required and cannot be empty.",
             )
+
         return None
 
     def __init__(self):
@@ -153,6 +157,36 @@ class AIOrchestratorService:
             response.status = "processing"
 
         return response
+
+    async def stream_task_status(self, task_id: str) -> AsyncGenerator[str, None]:
+        """
+        Generates SSE events for the task status.
+        Listens to Redis Pub/Sub for immediate push updates.
+        """
+        # 1. Initial check to prevent race conditions
+        initial_status = self.get_task_status(task_id)
+        yield f"data: {initial_status.model_dump_json()}\n\n"
+        if initial_status.status in ["completed", "failed"]:
+            return
+
+        # 2. Subscribe to Redis for pushed updates
+        redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe(f"ai_task_status:{task_id}")
+
+        try:
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    yield f"data: {message['data']}\n\n"
+                    try:
+                        data_dict = json.loads(message["data"])
+                        if data_dict.get("status") in ["completed", "failed"]:
+                            break
+                    except Exception:
+                        pass
+        finally:
+            await pubsub.unsubscribe()
+            await redis_client.aclose()
 
 
 orchestrator_service = AIOrchestratorService()
