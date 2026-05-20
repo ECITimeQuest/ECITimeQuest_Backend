@@ -37,9 +37,21 @@ def get_or_create_progress(db: Session, user_id: UUID) -> UserProgress:
     if not progress:
         try:
             progress = UserProgress(user_id=user_id)
+            # initialize sensible defaults to avoid None arithmetic in tests/runtime
+            progress.xp_total = 0
+            progress.level = 1
+            progress.coins = 0
+            progress.lives = MAX_LIVES
+            progress.lives_refill_at = None
+            progress.streak_day = 0
+            progress.longest_streak = 0
+            progress.last_activity_date = None
+
             db.add(progress)
             db.commit()
             db.refresh(progress)
+            # mark as persisted for call-sites that need to avoid double-add
+            setattr(progress, "_persisted", True)
         except IntegrityError:
             db.rollback()
             progress = db.query(UserProgress).filter(UserProgress.user_id == user_id).first()
@@ -123,15 +135,31 @@ def _apply_session_completion(
     session.completed = data.completed
     session.finished_at = finished_at or datetime.now(timezone.utc)
 
-    # Determine if this is an offline sync:
-    # - finished_at is provided (non-None) = offline sync = deduct lives here
-    # - finished_at is None = online quiz = lives already deducted in submit_answer
+    # Determine if this is an offline sync (explicit finished_at)
     is_offline_sync = finished_at is not None
-    
-    if is_offline_sync:
-        # Offline sync: session.lives_lost not yet set, calculate and deduct now
-        session.lives_lost = lives_lost
-        progress.lives = max(0, progress.lives - lives_lost)
+
+    # previous lives lost on session (could be accumulated by submit_answer)
+    previous_lost = session.lives_lost or 0
+    # accumulate lives lost for this completion
+    session.lives_lost = previous_lost + lives_lost
+
+    # Premium users do not lose lives
+    user = get_user_by_id(db, user_id)
+    if getattr(user, "subscription_plan", None) == SubscriptionPlan.PREMIUM:
+        # ensure we don't deduct for premium users
+        pass
+    else:
+        # Deduct only the additional lives not already deducted by submit_answer
+        additional_to_deduct = 0
+        if is_offline_sync:
+            additional_to_deduct = lives_lost
+        else:
+            # online finish: if no lives were lost during session (previous_lost == 0), deduct now
+            if previous_lost == 0:
+                additional_to_deduct = lives_lost
+
+        if additional_to_deduct > 0:
+            progress.lives = max(0, (progress.lives or 0) - additional_to_deduct)
     # else: online quiz, lives_lost already accumulated in session.lives_lost via submit_answer
     
     progress.xp_total += xp_gained
@@ -214,10 +242,25 @@ def submit_answer(db: Session, user_id: UUID, session_id: UUID, data: SubmitAnsw
         lives_lost = 1
     feedback = "Correct answer" if data.is_correct else "Review this concept and try again"
 
-    progress = get_or_create_progress(db, user_id)
+    # Prefer to avoid creating DB-backed progress records for trivial cases (e.g. correct answer, no changes)
+    progress = db.query(UserProgress).filter(UserProgress.user_id == user_id).first()
+    created_temp_progress = False
+    if not progress:
+        # create an in-memory progress object with sensible defaults; don't persist yet
+        progress = UserProgress(user_id=user_id)
+        progress.xp_total = 0
+        progress.level = 1
+        progress.coins = 0
+        progress.lives = MAX_LIVES
+        progress.lives_refill_at = None
+        progress.streak_day = 0
+        progress.longest_streak = 0
+        progress.last_activity_date = None
+        created_temp_progress = True
+
     if lives_lost > 0:
-        # decrement user lives and persist
-        progress.lives = max(0, progress.lives - lives_lost)
+        # decrement user lives and mark for persistence
+        progress.lives = max(0, (progress.lives or 0) - lives_lost)
         if progress.lives < MAX_LIVES and not progress.lives_refill_at:
             progress.lives_refill_at = datetime.now(timezone.utc) + timedelta(minutes=LIFE_REFILL_MINUTES)
 
@@ -226,6 +269,7 @@ def submit_answer(db: Session, user_id: UUID, session_id: UUID, data: SubmitAnsw
 
     # normalize concept to avoid whitespace/case mismatches
     concept_norm = (data.concept or "").strip()
+    persist_required = False
     if not data.is_correct:
         upsert_concept_gap(
             db,
@@ -238,6 +282,7 @@ def submit_answer(db: Session, user_id: UUID, session_id: UUID, data: SubmitAnsw
                 avg_response_time_ms=data.response_time_ms,
             ),
         )
+        persist_required = True
     else:
         try:
             removed = remove_concept_gap(db, user_id, session.topic_id, concept_norm)
@@ -245,13 +290,14 @@ def submit_answer(db: Session, user_id: UUID, session_id: UUID, data: SubmitAnsw
                 logger.debug("Removed resolved gap: user=%s topic=%s concept=%s", user_id, session.topic_id, concept_norm)
         except Exception:
             logger.exception("Error removing gap for user=%s topic=%s concept=%s", user_id, session.topic_id, concept_norm)
-    # persist progress and session so frontend sees updated lives immediately
+    # persist progress and session only when required
     try:
-        db.add(progress)
-        db.add(session)
-        db.commit()
-        db.refresh(progress)
-        db.refresh(session)
+        if not created_temp_progress or persist_required or (lives_lost > 0):
+            db.add(progress)
+            db.add(session)
+            db.commit()
+            db.refresh(progress)
+            db.refresh(session)
     except Exception:
         db.rollback()
         logger.exception("Failed to persist session/progress after submit_answer for user=%s session=%s", user_id, session_id)
