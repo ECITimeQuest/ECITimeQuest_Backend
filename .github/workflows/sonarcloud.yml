@@ -39,6 +39,17 @@ jobs:
           echo "---- coverage.xml head ----"
           if [ -f coverage.xml ]; then head -n 200 coverage.xml || true; fi
 
+      - name: Normalize coverage paths for Sonar
+        run: |
+          if [ -f coverage.xml ]; then
+            echo "Normalizing coverage source paths..."
+            sed -i "s|<source>.*app</source>|<source>app</source>|g" coverage.xml || true
+            echo "---- coverage.xml head (normalized) ----"
+            head -n 40 coverage.xml || true
+          else
+            echo "coverage.xml not found, skipping normalization"
+          fi
+
       - name: SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@49e6cd3b187936a73b8280d59ffd9da69df63ec9
         with:
